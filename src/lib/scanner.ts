@@ -331,6 +331,111 @@ export async function scanAccount(
         }
       }
 
+      // ── Step 1c: URL/Link Analysis ──
+      const urlRegex = /https?:\/\/[^\s<>"{}|\\^`\[\]]+/gi;
+      const messagesWithUrls = messages.filter((m) => urlRegex.test(m.body));
+      if (messagesWithUrls.length > 0) {
+        // Collect all unique URLs
+        const allUrls: Array<{ url: string; fromChild: boolean; body: string }> = [];
+        const seenUrls = new Set<string>();
+        for (const m of messagesWithUrls) {
+          const urls = m.body.match(urlRegex) || [];
+          for (const raw of urls) {
+            const url = raw.replace(/[.,;:!?)]+$/, "");
+            if (seenUrls.has(url)) continue;
+            seenUrls.add(url);
+            allUrls.push({ url, fromChild: !!m.from_child, body: m.body });
+          }
+        }
+
+        if (allUrls.length > 0) {
+          // Quick domain classification — flag suspicious patterns
+          const suspiciousDomains = ["bit.ly", "tinyurl.com", "t.co", "rb.gy", "shorturl.at", "ow.ly"];
+          const adultPatterns = [/porn/i, /xxx/i, /sex/i, /adult/i, /nsfw/i, /onlyfans/i, /cam[s]?\./i];
+          const gamblingPatterns = [/bet365/i, /casino/i, /poker/i, /gambl/i, /slots/i, /1xbet/i, /winner\.co/i];
+          const darkPatterns = [/telegram\.me.*drug/i, /t\.me.*buy/i, /dark/i, /tor2web/i, /\.onion/i];
+
+          const flaggedUrls: Array<{ url: string; reason: string; severity: string; fromChild: boolean }> = [];
+
+          for (const { url, fromChild, body } of allUrls) {
+            let domain = "";
+            try { domain = new URL(url).hostname.replace(/^www\./, ""); } catch { continue; }
+
+            // Shortened links from unknown contacts
+            if (suspiciousDomains.some((d) => domain.includes(d)) && !fromChild) {
+              flaggedUrls.push({ url, reason: "קישור מקוצר מאיש קשר — עלול להוביל לתוכן לא בטוח", severity: "low", fromChild });
+            }
+            // Adult content
+            if (adultPatterns.some((p) => p.test(url) || p.test(domain))) {
+              flaggedUrls.push({ url, reason: "קישור לתוכן מבוגרים", severity: "high", fromChild });
+            }
+            // Gambling
+            if (gamblingPatterns.some((p) => p.test(url) || p.test(domain))) {
+              flaggedUrls.push({ url, reason: "קישור להימורים", severity: "medium", fromChild });
+            }
+            // Dark web / drugs
+            if (darkPatterns.some((p) => p.test(url) || p.test(body))) {
+              flaggedUrls.push({ url, reason: "קישור חשוד — רשת אפלה או סמים", severity: "critical", fromChild });
+            }
+          }
+
+          // Also send URLs to AI for deeper analysis if there are non-obvious ones
+          const unflaggedUrls = allUrls.filter((u) => !flaggedUrls.some((f) => f.url === u.url));
+          if (unflaggedUrls.length > 0 && unflaggedUrls.length <= 20) {
+            try {
+              const urlList = unflaggedUrls.map((u) => `- ${u.url} (${u.fromChild ? "ילד" : "איש קשר"}) הקשר: "${u.body.slice(0, 100)}"`).join("\n");
+              const client = getClient();
+              const urlAiResponse = await client.chat.completions.create({
+                model: MODEL_FAST,
+                temperature: 0.1,
+                response_format: { type: "json_object" },
+                messages: [
+                  { role: "system", content: `אתה מומחה לבטיחות ילדים ברשת. בדוק קישורים שנשלחו בשיחות וואטסאפ של ילדים.
+סמן רק קישורים מסוכנים. קטגוריות: adult, gambling, drugs, violence, phishing, dangerous_social, other_dangerous.
+אם הקישור בטוח (YouTube ילדים, חנויות, חדשות) — אל תדווח.
+ענה ב-JSON: { "flaggedUrls": [{ "url": "...", "reason": "הסבר בעברית", "category": "...", "severity": "critical|high|medium|low", "confidence": 0.0-1.0 }] }
+אם אין מסוכנים: { "flaggedUrls": [] }` },
+                  { role: "user", content: `קישורים בשיחות של ${childName} (${childAge ? `בן/בת ${childAge}` : ""}):\n${urlList}` },
+                ],
+              });
+              const urlUsage = urlAiResponse.usage;
+              const urlCost = ((urlUsage?.prompt_tokens || 0) / 1_000_000) * 0.075 + ((urlUsage?.completion_tokens || 0) / 1_000_000) * 0.3;
+              const urlParsed = JSON.parse(urlAiResponse.choices[0]?.message?.content || "{}");
+              totalCost += urlCost;
+              if (urlParsed.flaggedUrls) {
+                for (const f of urlParsed.flaggedUrls) {
+                  if (f.confidence >= 0.6) {
+                    flaggedUrls.push({ url: f.url, reason: f.reason, severity: f.severity, fromChild: unflaggedUrls.find((u) => u.url === f.url)?.fromChild ?? false });
+                  }
+                }
+              }
+            } catch {}
+          }
+
+          // Create alerts for flagged URLs
+          for (const flagged of flaggedUrls) {
+            const urlAlert: Alert = {
+              severity: flagged.severity as Alert["severity"],
+              category: "url",
+              chatJid,
+              chatName,
+              summary: `קישור ${flagged.fromChild ? `שנשלח ע"י ${childName}` : `שנשלח ל-${childName}`}: ${flagged.reason}`,
+              recommendation: flagged.fromChild
+                ? `${childName} שלח${childGender === "girl" ? "ה" : ""} קישור שעלול להיות לא מתאים. מומלץ לברר ${childGender === "girl" ? "איתה" : "איתו"} על ההקשר.`
+                : `${childName} קיבל${childGender === "girl" ? "ה" : ""} קישור שעלול להיות מסוכן. שוחחו על זיהוי קישורים חשודים ואי-לחיצה על קישורים מאנשים לא מוכרים.`,
+              confidence: 0.85,
+            };
+            allAlerts.push(urlAlert);
+            recordRiskFlagForAccount(accountId, urlAlert, scanId);
+            queries.createAlert.run(
+              accountId, scanId, urlAlert.severity, urlAlert.category,
+              urlAlert.chatJid, urlAlert.chatName, urlAlert.summary,
+              urlAlert.recommendation, urlAlert.confidence, null
+            );
+          }
+        }
+      }
+
       // ── Step 2: Media Analysis (per chat) — paid plans only ──
       const chatMedia = queries.getUnanalyzedMediaForChat.all(accountId, chatJid, 20) as any[];
       if (chatMedia.length > 0) {
@@ -1029,6 +1134,7 @@ function categoryLabel(cat: string): string {
     threat: "איום",
     personal_info: "מידע אישי חשוף",
     location: "שיתוף מיקום",
+    url: "קישור חשוד",
   };
   return labels[cat] || cat;
 }
