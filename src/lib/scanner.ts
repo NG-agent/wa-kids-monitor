@@ -379,11 +379,64 @@ export async function scanAccount(
             }
           }
 
-          // Also send URLs to AI for deeper analysis if there are non-obvious ones
-          const unflaggedUrls = allUrls.filter((u) => !flaggedUrls.some((f) => f.url === u.url));
-          if (unflaggedUrls.length > 0 && unflaggedUrls.length <= 20) {
+          // Fetch content for all URLs (including flagged — to get better context)
+          const urlsToFetch = allUrls.slice(0, 20);
+          const fetchedContent: Array<{ url: string; fromChild: boolean; body: string; title?: string; description?: string; textSnippet?: string; finalUrl?: string; error?: string }> = [];
+
+          for (const u of urlsToFetch) {
+            const entry: typeof fetchedContent[0] = { ...u };
             try {
-              const urlList = unflaggedUrls.map((u) => `- ${u.url} (${u.fromChild ? "ילד" : "איש קשר"}) הקשר: "${u.body.slice(0, 100)}"`).join("\n");
+              const controller = new AbortController();
+              const timeout = setTimeout(() => controller.abort(), 5000);
+              const res = await fetch(u.url, {
+                signal: controller.signal,
+                headers: { "User-Agent": "Mozilla/5.0 (compatible; ShomerBot/1.0)" },
+                redirect: "follow",
+              });
+              clearTimeout(timeout);
+
+              entry.finalUrl = res.url; // after redirects
+
+              const contentType = res.headers.get("content-type") || "";
+              if (contentType.includes("text/html")) {
+                const html = await res.text();
+                // Title
+                const titleMatch = html.match(/<title[^>]*>([^<]+)<\/title>/i);
+                entry.title = titleMatch?.[1]?.trim().slice(0, 200);
+                // Meta description
+                const descMatch = html.match(/<meta[^>]*name=["']description["'][^>]*content=["']([^"']+)["']/i) ||
+                                  html.match(/<meta[^>]*property=["']og:description["'][^>]*content=["']([^"']+)["']/i);
+                entry.description = descMatch?.[1]?.trim().slice(0, 500);
+                // Text snippet — strip tags, get first meaningful text
+                const stripped = html
+                  .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, "")
+                  .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, "")
+                  .replace(/<[^>]+>/g, " ")
+                  .replace(/\s+/g, " ")
+                  .trim();
+                entry.textSnippet = stripped.slice(0, 800);
+              }
+            } catch (err) {
+              entry.error = err instanceof Error ? err.message : "fetch failed";
+            }
+            fetchedContent.push(entry);
+          }
+
+          // Send ALL URLs (with fetched content) to AI for analysis
+          const unflaggedUrls = allUrls.filter((u) => !flaggedUrls.some((f) => f.url === u.url));
+          const urlsForAi = fetchedContent.filter((u) => unflaggedUrls.some((uf) => uf.url === u.url) || u.finalUrl !== u.url); // include redirected URLs too
+          if (urlsForAi.length > 0) {
+            try {
+              const urlList = urlsForAi.map((u) => {
+                let desc = `- ${u.url}${u.finalUrl && u.finalUrl !== u.url ? ` → ${u.finalUrl}` : ""} (${u.fromChild ? "ילד" : "איש קשר"})`;
+                if (u.title) desc += `\n  כותרת: ${u.title}`;
+                if (u.description) desc += `\n  תיאור: ${u.description}`;
+                if (u.textSnippet) desc += `\n  תוכן: ${u.textSnippet.slice(0, 300)}`;
+                if (u.error) desc += `\n  [שגיאה בטעינה: ${u.error}]`;
+                desc += `\n  הקשר בשיחה: "${u.body.slice(0, 100)}"`;
+                return desc;
+              }).join("\n\n");
+
               const client = getClient();
               const urlAiResponse = await client.chat.completions.create({
                 model: MODEL_FAST,
@@ -391,11 +444,20 @@ export async function scanAccount(
                 response_format: { type: "json_object" },
                 messages: [
                   { role: "system", content: `אתה מומחה לבטיחות ילדים ברשת. בדוק קישורים שנשלחו בשיחות וואטסאפ של ילדים.
-סמן רק קישורים מסוכנים. קטגוריות: adult, gambling, drugs, violence, phishing, dangerous_social, other_dangerous.
-אם הקישור בטוח (YouTube ילדים, חנויות, חדשות) — אל תדווח.
-ענה ב-JSON: { "flaggedUrls": [{ "url": "...", "reason": "הסבר בעברית", "category": "...", "severity": "critical|high|medium|low", "confidence": 0.0-1.0 }] }
+אתה מקבל את תוכן העמוד (כותרת, תיאור, טקסט). נתח את התוכן בפועל — לא רק את הכתובת.
+שים לב במיוחד ל:
+- קישורים מקוצרים שמפנים לתוכן מבוגרים
+- אתרים שנראים תמימים אבל התוכן בעייתי
+- צ'אטים אנונימיים (Omegle, Chatroulette וכו')
+- קבוצות טלגרם/דיסקורד חשודות
+- אתרי הונאה או פישינג
+- תוכן אלים, סמים, הימורים
+- דייטינג אפליקציות לא מתאימות לגיל
+
+סמן רק מסוכנים. קטגוריות: adult, gambling, drugs, violence, phishing, dangerous_social, anonymous_chat, dating, other_dangerous.
+ענה ב-JSON: { "flaggedUrls": [{ "url": "...", "reason": "הסבר בעברית מבוסס על תוכן העמוד", "category": "...", "severity": "critical|high|medium|low", "confidence": 0.0-1.0 }] }
 אם אין מסוכנים: { "flaggedUrls": [] }` },
-                  { role: "user", content: `קישורים בשיחות של ${childName} (${childAge ? `בן/בת ${childAge}` : ""}):\n${urlList}` },
+                  { role: "user", content: `קישורים בשיחות של ${childName} (${childAge ? `בן/בת ${childAge}` : ""}):\n\n${urlList}` },
                 ],
               });
               const urlUsage = urlAiResponse.usage;
@@ -412,14 +474,16 @@ export async function scanAccount(
             } catch {}
           }
 
-          // Create alerts for flagged URLs
+          // Create alerts for flagged URLs (enrich with fetched title if available)
           for (const flagged of flaggedUrls) {
+            const fetched = fetchedContent.find((f) => f.url === flagged.url);
+            const titleInfo = fetched?.title ? ` (${fetched.title.slice(0, 60)})` : "";
             const urlAlert: Alert = {
               severity: flagged.severity as Alert["severity"],
               category: "url",
               chatJid,
               chatName,
-              summary: `קישור ${flagged.fromChild ? `שנשלח ע"י ${childName}` : `שנשלח ל-${childName}`}: ${flagged.reason}`,
+              summary: `קישור ${flagged.fromChild ? `שנשלח ע"י ${childName}` : `שנשלח ל-${childName}`}: ${flagged.reason}${titleInfo}`,
               recommendation: flagged.fromChild
                 ? `${childName} שלח${childGender === "girl" ? "ה" : ""} קישור שעלול להיות לא מתאים. מומלץ לברר ${childGender === "girl" ? "איתה" : "איתו"} על ההקשר.`
                 : `${childName} קיבל${childGender === "girl" ? "ה" : ""} קישור שעלול להיות מסוכן. שוחחו על זיהוי קישורים חשודים ואי-לחיצה על קישורים מאנשים לא מוכרים.`,
