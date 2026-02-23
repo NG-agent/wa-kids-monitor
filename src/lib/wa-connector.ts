@@ -269,6 +269,15 @@ export class WAConnector extends EventEmitter {
     } else if (content.documentMessage) {
       body = `[קובץ] ${content.documentMessage.title || content.documentMessage.fileName || ""}`;
       mediaType = "document";
+    } else if (content.locationMessage) {
+      const loc = content.locationMessage;
+      const name = loc.name || "";
+      const addr = loc.address || "";
+      body = `[מיקום${name ? ` — ${name}` : ""}${addr ? `, ${addr}` : ""}]`;
+      mediaType = "location";
+    } else if (content.liveLocationMessage) {
+      body = "[מיקום חי — שיתוף מיקום בזמן אמת]";
+      mediaType = "live_location";
     } else {
       return null;
     }

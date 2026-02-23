@@ -156,6 +156,7 @@ ${genderGuidance}
 🟡 MEDIUM:
 8. לחץ חברתי (pressure) — "אם לא תעשה X", "כולם עושים את זה", אתגרים מסוכנים
 9. שפה פוגענית (language) — גזענות, הומופוביה, שפה מבזה חריגה
+10. שיתוף מיקום (location) — שיתוף כתובת, מיקום, "אני ב...", "בוא ל...", שליחת מיקום בטקסט לאנשים לא מוכרים
 
 חשוב:
 - אתה מקבל הודעות חדשות + הקשר (הודעות קודמות). נתח את ההודעות החדשות בהקשר של השיחה.
@@ -172,7 +173,7 @@ ${genderGuidance}
   "findings": [
     {
       "severity": "critical|high|medium|low|info",
-      "category": "exclusion|suicidal|grooming|sexual|drugs|bullying|violence|pressure|language",
+      "category": "exclusion|suicidal|grooming|sexual|drugs|bullying|violence|pressure|language|location",
       "summary": "סיכום קצר בעברית של מה שזוהה",
       "recommendation": "המלצה להורה בעברית",
       "confidence": 0.0-1.0
@@ -289,6 +290,42 @@ export async function scanAccount(
             accountId, scanId, alert.severity, alert.category,
             alert.chatJid, alert.chatName, alert.summary,
             alert.recommendation, alert.confidence,
+            null
+          );
+        }
+      }
+
+      // ── Step 1b: Location Sharing Detection ──
+      const locationMessages = messages.filter(
+        (m) => m.from_child && (m.media_type === "location" || m.media_type === "live_location")
+      );
+      if (locationMessages.length > 0) {
+        const isGroup = chatJid.endsWith("@g.us");
+        const isSafe = !!queries.isSafeContact.get(accountId, chatJid);
+        // Flag if shared in group OR with non-safe contact
+        if (isGroup || !isSafe) {
+          const isLive = locationMessages.some((m) => m.media_type === "live_location");
+          const severity = isLive ? "high" : (isGroup ? "medium" : "low");
+          const locationAlert: Alert = {
+            severity,
+            category: "location",
+            chatJid,
+            chatName,
+            summary: isLive
+              ? `${childName} שיתפ${childGender === "girl" ? "ה" : ""} מיקום חי (בזמן אמת)${isGroup ? " בקבוצה" : " עם איש קשר לא מוכר"}`
+              : `${childName} שיתפ${childGender === "girl" ? "ה" : ""} מיקום${isGroup ? " בקבוצה" : " עם איש קשר לא מוכר"} (${locationMessages.length} פעמים)`,
+            recommendation: isLive
+              ? `שיתוף מיקום חי מאפשר מעקב אחרי מיקום ${childGender === "girl" ? "ילדתך" : "ילדך"} בזמן אמת. מומלץ לשוחח ${childGender === "girl" ? "איתה" : "איתו"} על סכנות שיתוף מיקום עם אנשים לא מוכרים.`
+              : `שיתוף מיקום${isGroup ? " בקבוצות" : ""} עלול לחשוף את מקום ${childGender === "girl" ? "הימצאותה" : "הימצאותו"} של ${childName}. שוחחו על בטיחות בשיתוף מידע אישי.`,
+            confidence: 0.95,
+          };
+          allAlerts.push(locationAlert);
+          recordRiskFlagForAccount(accountId, locationAlert, scanId);
+
+          queries.createAlert.run(
+            accountId, scanId, locationAlert.severity, locationAlert.category,
+            locationAlert.chatJid, locationAlert.chatName, locationAlert.summary,
+            locationAlert.recommendation, locationAlert.confidence,
             null
           );
         }
@@ -991,6 +1028,7 @@ function categoryLabel(cat: string): string {
     weapon: "נשק",
     threat: "איום",
     personal_info: "מידע אישי חשוף",
+    location: "שיתוף מיקום",
   };
   return labels[cat] || cat;
 }
