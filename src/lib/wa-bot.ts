@@ -316,6 +316,20 @@ async function handleIncomingMessage(phone: string, chatJid: string, text: strin
 async function handleKidMessage(ctx: ConversationContext, text: string): Promise<string> {
   const lower = text.toLowerCase().trim();
 
+  // Auto-initiated greeting from kid's Baileys connection → send full intro
+  if (lower === "היי שומר 👋" || lower === "היי שומר") {
+    ctx.state = "intro";
+    // Look up kid's name for personalization
+    const kidInfo = getKidInfo(ctx.phone);
+    return KID_INTRO_MESSAGE(kidInfo?.childName || "👋", kidInfo?.childGender || null);
+  }
+
+  // Check for menu/help request
+  if (/תפריט|עזרה|menu|help/.test(lower)) {
+    ctx.state = "menu";
+    return KID_MENU;
+  }
+
   // Check for menu selections
   if (lower === "1" || /חרם|הדרה|מבודד|לא מזמינים/.test(lower)) {
     ctx.state = "topic:exclusion";
@@ -502,9 +516,51 @@ async function generateKidSupportResponse(ctx: ConversationContext, text: string
 רוצה לדבר על משהו אחר? כתוב *תפריט*`;
 }
 
-// ─── Outbound: Send message to kid after scan ───
+// ─── Outbound: Initiate kid ↔ bot conversation ───
 
-export async function sendKidIntroMessage(
+/**
+ * Instead of the bot cold-messaging the kid (spam risk), use the kid's
+ * Baileys connection to send a message FROM the kid's WhatsApp TO the
+ * Shomer bot number. The bot then replies with the intro message.
+ * 
+ * WhatsApp sees it as kid-initiated → no spam risk.
+ * 
+ * @param connector - The kid's active WhatsApp connector (Baileys)
+ * @param childName - Used for personalizing the bot's reply
+ * @param childGender - For Hebrew gender-aware messages
+ */
+export async function initiateKidBotConversation(
+  connector: { sendMessage: (jid: string, text: string) => Promise<boolean> },
+  childName: string,
+  childGender: "boy" | "girl" | null
+): Promise<boolean> {
+  if (!BOT_NUMBER) {
+    console.error("[shomer-bot] SHOMER_BOT_NUMBER not set — cannot initiate kid conversation");
+    return false;
+  }
+
+  const botJid = normalizePhone(BOT_NUMBER) + "@s.whatsapp.net";
+  const kidMessage = `היי שומר 👋`; // Simple greeting from kid to bot
+
+  try {
+    const sent = await connector.sendMessage(botJid, kidMessage);
+    if (!sent) {
+      console.error("[shomer-bot] Failed to send kid→bot init message");
+      return false;
+    }
+    console.log(`[shomer-bot] Kid→bot init sent for ${childName}`);
+    return true;
+  } catch (err) {
+    console.error(`[shomer-bot] Kid→bot init failed:`, err);
+    return false;
+  }
+}
+
+/**
+ * Direct send from bot to kid — use ONLY as fallback if the Baileys
+ * connector approach fails. Higher spam risk.
+ */
+export async function sendKidIntroMessageDirect(
   kidPhone: string,
   childName: string,
   childGender: "boy" | "girl" | null
@@ -558,6 +614,17 @@ function detectRole(phone: string): "parent" | "kid" | "unknown" {
   // Check if monitored kid
   if (isMonitoredKid(phone)) return "kid";
   return "unknown";
+}
+
+function getKidInfo(phone: string): { childName: string; childGender: "boy" | "girl" | null } | null {
+  const normalized = normalizePhone(phone);
+  try {
+    const account = queries.getAccountByPhone?.get(normalized) as any;
+    if (account) {
+      return { childName: account.child_name || account.name, childGender: account.child_gender || null };
+    }
+  } catch {}
+  return null;
 }
 
 function isMonitoredKid(phone: string): boolean {

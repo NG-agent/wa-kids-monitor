@@ -603,6 +603,24 @@ export async function scanAccount(
     // Increment scan count for topic rotation
     queries.incrementScanCount.run(accountId);
 
+    // ── Send kid→bot intro message (via kid's Baileys connection) ──
+    // Only on first scan — introduces the kid to the Shomer support bot
+    const scanCount = (queries.getAccount.get(accountId) as any)?.scan_count || 0;
+    if (scanCount <= 1) {
+      try {
+        const { getConnector } = await import("./account-manager");
+        const { initiateKidBotConversation } = await import("./wa-bot");
+        const connector = await getConnector(accountId);
+        if (connector && connector.isReady()) {
+          onProgress?.("📱 מחבר את הילד/ה לערוץ התמיכה...");
+          await initiateKidBotConversation(connector, childName, childGender as "boy" | "girl" | null);
+        }
+      } catch (err) {
+        // Non-critical — don't fail scan if bot intro fails
+        console.error("[scanner] Kid bot intro failed:", err);
+      }
+    }
+
     // ── Free plan: disconnect WhatsApp link after scan (security) ──
     if (isFreePlan) {
       onProgress?.("🔒 תוכנית חינם — מנתק את הקישור לוואטסאפ לאבטחה");

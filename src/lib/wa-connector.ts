@@ -330,6 +330,22 @@ export class WAConnector extends EventEmitter {
     return this.syncDone;
   }
 
+  /**
+   * Send a message FROM the kid's WhatsApp to a target number.
+   * Used to initiate conversation with the Shomer bot — so the kid "starts" the chat,
+   * avoiding spam detection on the bot number.
+   */
+  async sendMessage(targetJid: string, text: string): Promise<boolean> {
+    if (!this.socket) return false;
+    try {
+      await this.socket.sendMessage(targetJid, { text });
+      return true;
+    } catch (err) {
+      console.error(`[${this.accountId}] Failed to send message to ${targetJid}:`, err);
+      return false;
+    }
+  }
+
   async disconnect(): Promise<void> {
     if (this.socket) {
       this.socket.end(undefined);
