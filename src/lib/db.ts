@@ -246,6 +246,8 @@ export const queries = {
   // Accounts (children)
   createAccount: db.prepare(`INSERT INTO accounts (id, name, child_name, child_birthdate, child_gender) VALUES (?, ?, ?, ?, ?)`),
   getAccount: db.prepare(`SELECT * FROM accounts WHERE id = ?`),
+  getAccountByPhone: db.prepare(`SELECT * FROM accounts WHERE phone = ?`),
+  hasMessagesFromJid: db.prepare(`SELECT 1 FROM messages WHERE sender_jid = ? AND from_child = 1 LIMIT 1`),
   listAccounts: db.prepare(`SELECT * FROM accounts ORDER BY created_at`),
   updateAccountStatus: db.prepare(`UPDATE accounts SET status = ?, updated_at = unixepoch() WHERE id = ?`),
   updateAccountTos: db.prepare(`UPDATE accounts SET tos_accepted = 1, tos_accepted_at = unixepoch() WHERE id = ?`),

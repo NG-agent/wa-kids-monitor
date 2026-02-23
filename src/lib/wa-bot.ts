@@ -1,0 +1,624 @@
+/**
+ * Shomer WhatsApp Bot — handles incoming messages from parents & kids
+ * 
+ * One WhatsApp number serves two audiences:
+ * 1. Parents: registration, reports, management
+ * 2. Kids: safe channel for help with bullying, grooming, etc.
+ */
+
+import makeWASocket, {
+  useMultiFileAuthState,
+  DisconnectReason,
+  type WASocket,
+} from "@whiskeysockets/baileys";
+import pino from "pino";
+import path from "path";
+import fs from "fs";
+import { queries } from "./db";
+
+const BOT_SESSION_DIR = path.join(process.cwd(), "data", "wa-bot-session");
+const BOT_NUMBER = process.env.SHOMER_BOT_NUMBER || ""; // e.g. "972501234567"
+
+// ─── Types ───
+
+interface BotState {
+  socket: WASocket | null;
+  status: "disconnected" | "connecting" | "qr" | "ready";
+  qrCode?: string;
+}
+
+interface ConversationContext {
+  phone: string;
+  role: "parent" | "kid" | "unknown";
+  state: string; // FSM state
+  data: Record<string, any>;
+  lastActivity: number;
+}
+
+// In-memory conversation state (per phone number)
+const conversations = new Map<string, ConversationContext>();
+
+// ─── Kid Support Messages ───
+
+const KID_INTRO_MESSAGE = (childName: string, gender: "boy" | "girl" | null) => {
+  const hey = gender === "girl" ? "היי" : "היי";
+  return `${hey} ${childName} 👋
+
+אני שומר — בוט שנועד לעזור לילדים ונוער לדבר על דברים שקשה לדבר עליהם.
+
+אם משהו מטריד אותך — אתה יכול לכתוב לי. הכל בסודיות.
+
+אפשר לדבר על:
+🛡️ חרם או הדרה בכיתה
+😔 מישהו שמציק לך
+📱 מישהו שביקש ממך תמונות לא נעימות
+💊 לחץ מחברים לעשות דברים
+😰 מחשבות קשות
+
+פשוט כתוב לי מה קורה, ואני אעזור 💙`;
+};
+
+const KID_MENU = `אני כאן בשבילך. על מה תרצה לדבר?
+
+1️⃣ עושים עליי חרם בכיתה
+2️⃣ מישהו מציק לי / מאיים עליי
+3️⃣ מישהו ביקש ממני תמונה לא נעימה
+4️⃣ חבר/ה שלי במצוקה
+5️⃣ משהו אחר שמטריד אותי
+
+כתוב מספר או פשוט ספר מה קורה 💙`;
+
+// ─── Kid Response Templates ───
+
+const KID_RESPONSES: Record<string, string> = {
+  exclusion: `😔 חרם זה דבר כואב מאוד ואתה לא לבד בזה.
+
+כמה דברים חשובים:
+• זה *לא* האשמה שלך. חרם אומר הרבה על מי שעושה אותו, לא עליך
+• אל תנסה לשנות את עצמך כדי "להתקבל" — אתה בסדר כמו שאתה
+• נסה למצוא אדם אחד שאתה סומך עליו — חבר, מורה, יועצת
+• זה לגיטימי לספר למבוגר שאתה סומך עליו
+
+💡 טיפ: לפעמים כשעוזרים לפנות למבוגר בבית הספר, הדברים משתפרים מהר.
+
+רוצה שאעזור לך לחשוב איך לספר למישהו?`,
+
+  bullying: `😟 מצער לשמוע שמישהו מציק לך.
+
+כמה דברים חשובים:
+• אף אחד לא צריך לסבול הצקות — זה *לא* נורמלי
+• אם יש איומים — חשוב מאוד לספר למבוגר
+• שמור הוכחות (צילומי מסך) — זה יכול לעזור
+• אל תגיב באלימות, גם אם מתחשק — זה רק מחמיר
+
+📞 אם אתה מרגיש בסכנה, ספר *עכשיו* להורה, מורה, או התקשר ל-*105* (ער"ן)
+
+רוצה לספר יותר על מה שקורה?`,
+
+  sexual: `⚠️ חשוב שאתה מדבר על זה.
+
+כללי ברזל:
+• *אף אחד* לא רשאי לבקש ממך תמונות של הגוף שלך
+• גם אם זה חבר/ה — זה לא בסדר ואתה לא חייב
+• אם כבר שלחת — זה לא סוף העולם, אבל חשוב לפעול
+• *אל תמחק* — שמור הוכחות
+
+🚨 מה לעשות:
+1. ספר מיד להורה או מבוגר שאתה סומך עליו
+2. חסום את האדם שביקש
+3. אל תשלח תמונות נוספות גם אם מאיימים
+
+📞 קו חם: *105* (ער"ן) — אנונימי, בחינם, 24/7
+
+רוצה שאעזור לך לחשוב מה הצעד הבא?`,
+
+  friend_distress: `💙 זה ממש חשוב שאכפת לך מהחבר/ה שלך.
+
+כמה דברים שאתה יכול לעשות:
+• תגיד לחבר/ה שאתה שם בשבילו — זה כבר עוזר
+• אל תשמור את זה רק לעצמך — ספר למבוגר שאתה סומך עליו
+• אם החבר/ה שלך דיבר/ה על לפגוע בעצמו/ה — זה *דחוף*, ספר למבוגר עכשיו
+
+📞 מספרים חשובים:
+• *105* — ער"ן (לילדים ונוער)
+• *1201* — עמותת ער"ן
+• *110* — נט"ל (לחירום נפשי)
+
+אתה עושה דבר אמיץ שאתה מחפש עזרה. רוצה לספר יותר?`,
+
+  other: `💙 אני שומע אותך.
+
+ספר לי יותר על מה שקורה, ואני אנסה לעזור.
+
+אם אתה לא בטוח איך להגיד — אפשר גם:
+• לשלוח הודעה קולית
+• לכתוב אפילו מילה אחת שמתארת מה אתה מרגיש
+
+אני כאן 💙`,
+};
+
+// ─── Parent Registration Flow ───
+
+const PARENT_WELCOME = `🛡️ שלום! ברוכים הבאים לשומר.
+
+שומר מנטר את שיחות הוואטסאפ של ילדך ומזהה תכנים מסוכנים כמו בריונות, הטרדה, סמים ועוד — בפרטיות מלאה.
+
+מה תרצו לעשות?
+
+1️⃣ הרשמה — התחלת ניטור
+2️⃣ איך זה עובד?
+3️⃣ מחירים
+4️⃣ כבר רשום — כניסה לפורטל`;
+
+const PARENT_HOW_IT_WORKS = `📱 איך שומר עובד?
+
+1️⃣ מקשרים את הוואטסאפ של הילד/ה (סריקת QR)
+2️⃣ המערכת סורקת שיחות עם AI מתקדם
+3️⃣ מקבלים דוח עם ממצאים + טיפים לשיחה
+
+🔍 מה אנחנו מזהים:
+• חרם חברתי והדרה
+• בריונות ואיומים
+• הטרדה מינית וטיפוח
+• שימוש בסמים ואלכוהול
+• מחשבות אובדניות
+• קישורים מסוכנים ושיתוף מיקום
+
+🔒 ההודעות לא נשמרות — רק סיכומי AI.
+👶 הילד מקבל גם ערוץ תמיכה אנונימי.
+
+רוצים להתחיל? כתבו *הרשמה*`;
+
+const PARENT_PRICING = `💰 תוכניות שומר:
+
+🆓 *חינם*
+• סריקה ידנית פעם בחודש
+• טקסט בלבד (ללא מדיה)
+• הקישור מתנתק אחרי סריקה
+
+📦 *בסיסי — ₪19/חודש*
+• סריקה אוטומטית שבועית
+• כולל תמונות וסרטונים
+• הקישור נשאר פעיל
+
+⭐ *מתקדם — ₪29/חודש*
+• סריקה אוטומטית יומית
+• כולל תמונות וסרטונים
+• התראות בזמן אמת
+
+💡 מנוי שנתי: חיסכון של 20%
+👨‍👩‍👧‍👦 מהילד השני: הנחה של 30%
+
+רוצים להתחיל? כתבו *הרשמה*`;
+
+// ─── Bot Core ───
+
+const botState: BotState = {
+  socket: null,
+  status: "disconnected",
+};
+
+export function getBotState(): BotState {
+  return botState;
+}
+
+export async function startBot(): Promise<void> {
+  if (botState.status === "ready" || botState.status === "connecting") return;
+
+  botState.status = "connecting";
+  fs.mkdirSync(BOT_SESSION_DIR, { recursive: true });
+
+  const { state, saveCreds } = await useMultiFileAuthState(BOT_SESSION_DIR);
+  const logger = pino({ level: "silent" });
+
+  const socket = makeWASocket({
+    auth: state,
+    logger,
+    printQRInTerminal: false,
+    browser: ["Shomer Bot", "Chrome", "1.0.0"],
+  });
+
+  botState.socket = socket;
+
+  socket.ev.on("creds.update", saveCreds);
+
+  socket.ev.on("connection.update", (update) => {
+    const { connection, lastDisconnect, qr } = update;
+
+    if (qr) {
+      botState.status = "qr";
+      botState.qrCode = qr;
+    }
+
+    if (connection === "open") {
+      botState.status = "ready";
+      console.log("[shomer-bot] Connected and ready");
+    }
+
+    if (connection === "close") {
+      const statusCode = (lastDisconnect?.error as any)?.output?.statusCode;
+      if (statusCode === DisconnectReason.loggedOut) {
+        botState.status = "disconnected";
+        console.log("[shomer-bot] Logged out");
+      } else {
+        botState.status = "connecting";
+        setTimeout(() => startBot(), 5000);
+      }
+    }
+  });
+
+  // Handle incoming messages
+  socket.ev.on("messages.upsert", async (data) => {
+    for (const msg of data.messages) {
+      if (msg.key.fromMe) continue;
+      if (!msg.message) continue;
+
+      const chatJid = msg.key.remoteJid || "";
+      if (!chatJid || chatJid.endsWith("@g.us") || chatJid === "status@broadcast") continue;
+
+      const text = msg.message.conversation ||
+        msg.message.extendedTextMessage?.text || "";
+      if (!text.trim()) continue;
+
+      const phone = chatJid.replace("@s.whatsapp.net", "");
+      await handleIncomingMessage(phone, chatJid, text.trim());
+    }
+  });
+}
+
+// ─── Message Handler ───
+
+async function handleIncomingMessage(phone: string, chatJid: string, text: string): Promise<void> {
+  const socket = botState.socket;
+  if (!socket) return;
+
+  // Determine role: is this a known parent? a known kid?
+  let ctx = conversations.get(phone);
+  if (!ctx) {
+    const role = detectRole(phone);
+    ctx = { phone, role, state: "start", data: {}, lastActivity: Date.now() };
+    conversations.set(phone, ctx);
+  }
+  ctx.lastActivity = Date.now();
+
+  let reply: string;
+
+  if (ctx.role === "kid") {
+    reply = await handleKidMessage(ctx, text);
+  } else if (ctx.role === "parent") {
+    reply = await handleParentMessage(ctx, text);
+  } else {
+    // Unknown — try to detect
+    const isParent = !!queries.getParentByPhone?.get(normalizePhone(phone));
+    if (isParent) {
+      ctx.role = "parent";
+      reply = await handleParentMessage(ctx, text);
+    } else {
+      // Check if it's a kid we monitor
+      const isKid = isMonitoredKid(phone);
+      if (isKid) {
+        ctx.role = "kid";
+        reply = await handleKidMessage(ctx, text);
+      } else {
+        // New user — assume parent (most likely scenario)
+        ctx.role = "parent";
+        ctx.state = "start";
+        reply = PARENT_WELCOME;
+      }
+    }
+  }
+
+  await socket.sendMessage(chatJid, { text: reply });
+}
+
+// ─── Kid Message Handler ───
+
+async function handleKidMessage(ctx: ConversationContext, text: string): Promise<string> {
+  const lower = text.toLowerCase().trim();
+
+  // Check for menu selections
+  if (lower === "1" || /חרם|הדרה|מבודד|לא מזמינים/.test(lower)) {
+    ctx.state = "topic:exclusion";
+    return KID_RESPONSES.exclusion;
+  }
+  if (lower === "2" || /מציק|מאיים|בריונות|מכה|מפחיד/.test(lower)) {
+    ctx.state = "topic:bullying";
+    return KID_RESPONSES.bullying;
+  }
+  if (lower === "3" || /תמונ|עירום|סקסט|נודס|ביקש.*תמונה|שלח.*תמונה/.test(lower)) {
+    ctx.state = "topic:sexual";
+    return KID_RESPONSES.sexual;
+  }
+  if (lower === "4" || /חבר.*מצוקה|חברה.*מצוקה|חבר.*רע|לפגוע בעצמ/.test(lower)) {
+    ctx.state = "topic:friend_distress";
+    return KID_RESPONSES.friend_distress;
+  }
+  if (lower === "5" || lower === "משהו אחר") {
+    ctx.state = "topic:other";
+    return KID_RESPONSES.other;
+  }
+
+  // If in a topic conversation, provide empathetic AI response
+  if (ctx.state.startsWith("topic:")) {
+    return await generateKidSupportResponse(ctx, text);
+  }
+
+  // Default — show menu
+  ctx.state = "menu";
+  return KID_MENU;
+}
+
+// ─── Parent Message Handler ───
+
+async function handleParentMessage(ctx: ConversationContext, text: string): Promise<string> {
+  const lower = text.toLowerCase().trim();
+
+  // Registration flow
+  if (lower === "1" || /הרשמה|התחל|רישום/.test(lower)) {
+    ctx.state = "register:name";
+    return `📝 מעולה! בואו נתחיל.
+מה השם שלך?`;
+  }
+
+  if (lower === "2" || /איך.*עובד/.test(lower)) {
+    return PARENT_HOW_IT_WORKS;
+  }
+
+  if (lower === "3" || /מחיר|עלות|כמה/.test(lower)) {
+    return PARENT_PRICING;
+  }
+
+  if (lower === "4" || /פורטל|כניס|חשבון/.test(lower)) {
+    // Generate portal link
+    const parent = queries.getParentByPhone?.get(normalizePhone(ctx.phone)) as any;
+    if (parent) {
+      const token = generatePortalToken(parent.id);
+      return `🔗 הנה הקישור לפורטל שלך:\nhttps://shomer.app/portal/${token}\n\nהקישור תקף ל-7 ימים.`;
+    }
+    return `לא מצאנו חשבון עם המספר הזה. רוצים להירשם? כתבו *הרשמה*`;
+  }
+
+  // Registration FSM
+  if (ctx.state === "register:name") {
+    ctx.data.parentName = text;
+    ctx.state = "register:child_name";
+    return `שלום ${text}! 👋
+מה השם של הילד/ה שתרצו לנטר?`;
+  }
+
+  if (ctx.state === "register:child_name") {
+    ctx.data.childName = text;
+    ctx.state = "register:child_age";
+    return `בן/בת כמה ${text}?`;
+  }
+
+  if (ctx.state === "register:child_age") {
+    const age = parseInt(text);
+    if (isNaN(age) || age < 5 || age > 18) {
+      return `הגיל חייב להיות בין 5 ל-18. נסו שוב:`;
+    }
+    ctx.data.childAge = age;
+    ctx.state = "register:child_gender";
+    return `${ctx.data.childName} בן או בת?
+
+1️⃣ בן
+2️⃣ בת`;
+  }
+
+  if (ctx.state === "register:child_gender") {
+    if (lower === "1" || /בן/.test(lower)) {
+      ctx.data.childGender = "boy";
+    } else if (lower === "2" || /בת/.test(lower)) {
+      ctx.data.childGender = "girl";
+    } else {
+      return `אנא בחרו: 1 לבן, 2 לבת`;
+    }
+    ctx.state = "register:tos";
+    return `📋 *תנאי שימוש — שומר*
+
+• השירות מנטר וואטסאפ של ילדך באמצעות AI
+• אתם מצהירים שאתם הבעלים של המכשיר
+• ההודעות לא נשמרות, רק ניתוחי AI
+• מומלץ ליידע את הילד/ה
+• הילד/ה יקבל ערוץ תמיכה אנונימי
+
+כתבו *מאשר* להמשך או *ביטול* לביטול`;
+  }
+
+  if (ctx.state === "register:tos") {
+    if (/מאשר|אישור|כן/.test(lower)) {
+      ctx.state = "register:connect";
+      // Create parent + account in DB
+      const parentId = createParentIfNeeded(ctx.phone, ctx.data.parentName);
+      const accountId = createChildAccount(parentId, ctx.data);
+      ctx.data.accountId = accountId;
+      ctx.data.parentId = parentId;
+
+      return `✅ מעולה! החשבון נוצר.
+
+עכשיו צריך לחבר את הוואטסאפ של ${ctx.data.childName}.
+
+🔗 פתחו את הקישור הזה:
+https://shomer.app/pair/${accountId}
+
+או סרקו QR מהמחשב:
+https://shomer.app/pair/${accountId}?qr=1
+
+(הקישור תקף ל-10 דקות)
+
+אחרי החיבור תקבלו הודעה כאן ✅`;
+    }
+    if (/ביטול|לא/.test(lower)) {
+      ctx.state = "start";
+      return `❌ ההרשמה בוטלה. אם תרצו לנסות שוב — כתבו *הרשמה*`;
+    }
+    return `כתבו *מאשר* להמשך או *ביטול* לביטול`;
+  }
+
+  // Default
+  if (ctx.state === "start" || !ctx.state) {
+    return PARENT_WELCOME;
+  }
+
+  return PARENT_WELCOME;
+}
+
+// ─── AI-Powered Kid Support ───
+
+async function generateKidSupportResponse(ctx: ConversationContext, text: string): Promise<string> {
+  // For now, provide empathetic template responses
+  // TODO: integrate with OpenRouter for personalized AI support
+
+  const topic = ctx.state.replace("topic:", "");
+  const empathyPhrases = [
+    "אני שומע אותך 💙",
+    "זה לגיטימי להרגיש ככה.",
+    "תודה שאתה משתף אותי.",
+    "אתה לא לבד בזה.",
+  ];
+  const randomEmpathy = empathyPhrases[Math.floor(Math.random() * empathyPhrases.length)];
+
+  // Check for crisis keywords
+  if (/למות|להתאבד|לסיים|אין טעם|לא רוצה לחיות|לפגוע בעצמ/.test(text)) {
+    return `🚨 ${randomEmpathy}
+
+מה שאתה מרגיש עכשיו זה קשה מאוד, ויש אנשים שיכולים לעזור לך *עכשיו*.
+
+📞 *התקשר עכשיו:*
+• *105* — ער"ן (קו חירום לילדים ונוער, 24/7)
+• *110* — נט"ל (סיוע נפשי)
+• *1201* — עמותת ער"ן
+
+אתה חשוב. יש אנשים שאכפת להם. 💙`;
+  }
+
+  return `${randomEmpathy}
+
+תרגיש חופשי לספר עוד. אני כאן.
+
+💡 תזכור — תמיד אפשר גם:
+📞 *105* — ער"ן (ילדים ונוער, 24/7, אנונימי, בחינם)
+
+רוצה לדבר על משהו אחר? כתוב *תפריט*`;
+}
+
+// ─── Outbound: Send message to kid after scan ───
+
+export async function sendKidIntroMessage(
+  kidPhone: string,
+  childName: string,
+  childGender: "boy" | "girl" | null
+): Promise<boolean> {
+  const socket = botState.socket;
+  if (!socket || botState.status !== "ready") return false;
+
+  const jid = normalizePhone(kidPhone) + "@s.whatsapp.net";
+  try {
+    await socket.sendMessage(jid, { text: KID_INTRO_MESSAGE(childName, childGender) });
+    return true;
+  } catch (err) {
+    console.error(`[shomer-bot] Failed to send intro to ${kidPhone}:`, err);
+    return false;
+  }
+}
+
+// ─── Outbound: Send report to parent ───
+
+export async function sendParentReport(
+  parentPhone: string,
+  reportText: string
+): Promise<boolean> {
+  const socket = botState.socket;
+  if (!socket || botState.status !== "ready") return false;
+
+  const jid = normalizePhone(parentPhone) + "@s.whatsapp.net";
+  try {
+    await socket.sendMessage(jid, { text: reportText });
+    return true;
+  } catch (err) {
+    console.error(`[shomer-bot] Failed to send report to ${parentPhone}:`, err);
+    return false;
+  }
+}
+
+// ─── Helpers ───
+
+function normalizePhone(phone: string): string {
+  let p = phone.replace(/[\s\-()]/g, "");
+  if (p.startsWith("0")) p = "972" + p.slice(1);
+  if (p.startsWith("+")) p = p.slice(1);
+  return p;
+}
+
+function detectRole(phone: string): "parent" | "kid" | "unknown" {
+  const normalized = normalizePhone(phone);
+  // Check if parent
+  const parent = queries.getParentByPhone?.get(normalized) as any;
+  if (parent) return "parent";
+  // Check if monitored kid
+  if (isMonitoredKid(phone)) return "kid";
+  return "unknown";
+}
+
+function isMonitoredKid(phone: string): boolean {
+  // Check if any account has this phone, or if messages exist from this JID
+  const normalized = normalizePhone(phone);
+  try {
+    // Check accounts table phone field
+    const account = queries.getAccountByPhone?.get(normalized) as any;
+    if (account) return true;
+    // Check if we have messages from this JID (child sent messages)
+    const jid = normalized + "@s.whatsapp.net";
+    const msg = queries.hasMessagesFromJid?.get(jid) as any;
+    return !!msg;
+  } catch {
+    return false;
+  }
+}
+
+function createParentIfNeeded(phone: string, name: string): string {
+  const normalized = normalizePhone(phone);
+  const existing = queries.getParentByPhone?.get(normalized) as any;
+  if (existing) return existing.id;
+
+  const id = `parent_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+  queries.createParent?.run(id, normalized, name);
+  return id;
+}
+
+function createChildAccount(parentId: string, data: Record<string, any>): string {
+  const id = `acc_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+  const scanCode = Math.floor(100000 + Math.random() * 900000).toString();
+
+  // createAccount expects: id, name, child_name, child_birthdate, child_gender
+  queries.createAccount?.run(
+    id,
+    data.childName, // name
+    data.childName, // child_name
+    null,           // child_birthdate
+    data.childGender
+  );
+
+  // Link parent to child
+  queries.linkParentChild?.run(parentId, id, "primary");
+
+  return id;
+}
+
+function generatePortalToken(parentId: string): string {
+  const token = Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2);
+  queries.createParentToken?.run(token, parentId, Math.floor(Date.now() / 1000) + 7 * 86400);
+  return token;
+}
+
+// ─── Cleanup stale conversations (every hour) ───
+
+setInterval(() => {
+  const staleMs = 2 * 60 * 60 * 1000; // 2 hours
+  const now = Date.now();
+  for (const [phone, ctx] of conversations) {
+    if (now - ctx.lastActivity > staleMs) {
+      conversations.delete(phone);
+    }
+  }
+}, 60 * 60 * 1000);
